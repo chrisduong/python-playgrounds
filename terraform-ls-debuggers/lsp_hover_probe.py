@@ -91,7 +91,7 @@ class LspClient:
     def drain_pending(self, seconds):
         end = time.time() + seconds
         while time.time() < end:
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.3)
+            r, _, _ = select.select([self.stdout], [], [], 0.3)
             if not r:
                 break
             self.read_message()
@@ -99,7 +99,7 @@ class LspClient:
     def wait_for_response(self, request_id, timeout):
         end = time.time() + timeout
         while time.time() < end:
-            r, _, _ = select.select([self.proc.stdout], [], [], 1.0)
+            r, _, _ = select.select([self.stdout], [], [], 1.0)
             if r:
                 m = self.read_message()
                 if m and m.get("id") == request_id:
