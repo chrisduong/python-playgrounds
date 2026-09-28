@@ -12,6 +12,7 @@ Usage:
 --at LINE:WORD hovers at the first occurrence of WORD on that 1-indexed line.
 --at LINE:COL  hovers at that exact 1-indexed line / 0-indexed character.
 """
+
 import argparse
 import json
 import select
@@ -39,13 +40,22 @@ class LspClient:
     def __init__(self, tfls_path, log_file):
         self.proc = subprocess.Popen(
             [tfls_path, "serve", f"-log-file={log_file}"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
         )
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        assert self.proc.stderr is not None
+        self.stdin = self.proc.stdin
+        self.stdout = self.proc.stdout
+        self.stderr = self.proc.stderr
         self._id = 0
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     def _drain_stderr(self):
-        for line in self.proc.stderr:
+        for line in self.stderr:
             sys.stderr.write("[terraform-ls stderr] " + line.decode("utf-8", "replace"))
 
     def _next_id(self):
@@ -57,15 +67,15 @@ class LspClient:
         if is_request:
             msg["id"] = self._next_id()
         body = json.dumps(msg).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
-        self.proc.stdin.write(header + body)
-        self.proc.stdin.flush()
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
+        self.stdin.write(header + body)
+        self.stdin.flush()
         return msg.get("id")
 
     def read_message(self):
         headers = {}
         while True:
-            line = self.proc.stdout.readline()
+            line = self.stdout.readline()
             if not line:
                 return None
             line = line.decode("utf-8").strip()
@@ -75,7 +85,7 @@ class LspClient:
                 k, v = line.split(":", 1)
                 headers[k.strip()] = v.strip()
         length = int(headers.get("Content-Length", "0"))
-        body = self.proc.stdout.read(length)
+        body = self.stdout.read(length)
         return json.loads(body.decode("utf-8"))
 
     def drain_pending(self, seconds):
@@ -101,20 +111,36 @@ class LspClient:
         self.send("exit", {}, is_request=False)
         try:
             self.proc.wait(timeout=5)
-        except Exception:
+        except subprocess.TimeoutExpired:
             self.proc.kill()
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--tfls", required=True, help="path to terraform-ls binary")
-    ap.add_argument("--workdir", required=True, help="module/workspace directory (used as rootUri)")
+    ap.add_argument(
+        "--workdir", required=True, help="module/workspace directory (used as rootUri)"
+    )
     ap.add_argument("--file", required=True, help="file to open, relative to --workdir")
-    ap.add_argument("--at", action="append", required=True, dest="targets",
-                     help="LINE:WORD or LINE:COL to hover at; repeatable")
+    ap.add_argument(
+        "--at",
+        action="append",
+        required=True,
+        dest="targets",
+        help="LINE:WORD or LINE:COL to hover at; repeatable",
+    )
     ap.add_argument("--log-file", default="/tmp/terraform-ls-probe.log")
-    ap.add_argument("--settle", type=float, default=6.0, help="seconds to wait for initial indexing")
-    ap.add_argument("--timeout", type=float, default=10.0, help="seconds to wait for each hover response")
+    ap.add_argument(
+        "--settle", type=float, default=6.0, help="seconds to wait for initial indexing"
+    )
+    ap.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait for each hover response",
+    )
     args = ap.parse_args()
 
     file_path = f"{args.workdir}/{args.file}"
@@ -126,22 +152,33 @@ def main():
 
     client = LspClient(args.tfls, args.log_file)
 
-    client.send("initialize", {
-        "processId": None,
-        "rootUri": root_uri,
-        "workspaceFolders": [{"uri": root_uri, "name": "probe"}],
-        "capabilities": {"textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}}},
-    })
+    client.send(
+        "initialize",
+        {
+            "processId": None,
+            "rootUri": root_uri,
+            "workspaceFolders": [{"uri": root_uri, "name": "probe"}],
+            "capabilities": {
+                "textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}}
+            },
+        },
+    )
     # drain the initialize response (and any preceding window/showMessage notifications)
     client.drain_pending(2)
 
     client.send("initialized", {}, is_request=False)
-    client.send("textDocument/didOpen", {
-        "textDocument": {
-            "uri": file_uri, "languageId": "terraform", "version": 1,
-            "text": "\n".join(lines) + "\n",
-        }
-    }, is_request=False)
+    client.send(
+        "textDocument/didOpen",
+        {
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "terraform",
+                "version": 1,
+                "text": "\n".join(lines) + "\n",
+            }
+        },
+        is_request=False,
+    )
 
     # Let terraform-ls finish its async indexing jobs before hovering, otherwise
     # you'll race it and get a spurious "-32800 file not found" hover error.
@@ -150,10 +187,13 @@ def main():
 
     for spec in args.targets:
         line_1idx, word, char = parse_target(spec, lines)
-        req_id = client.send("textDocument/hover", {
-            "textDocument": {"uri": file_uri},
-            "position": {"line": line_1idx - 1, "character": char},
-        })
+        req_id = client.send(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line_1idx - 1, "character": char},
+            },
+        )
         resp = client.wait_for_response(req_id, args.timeout)
         result = resp.get("result") if resp else "TIMEOUT (no response)"
         print(f"line {line_1idx:4d} col {char:3d} {word:15s} -> {result!r}"[:300])
@@ -163,4 +203,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
